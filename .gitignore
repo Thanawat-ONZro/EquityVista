@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.nbconvert.ipynb
+models/*.keras
+models/*.pkl
