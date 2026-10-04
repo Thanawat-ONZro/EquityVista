@@ -11,3 +11,4 @@ models/*.keras
 models/*.pkl
 models/*.txt
 models/*.npz
+models/*.json

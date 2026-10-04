@@ -9,6 +9,7 @@ Two heads, same features: target 0 = y (t+1 log ret), target 1 = y5 (t+1..t+5,
 NaN tail rows masked). The 5-day head is cheap and feeds the decile spread.
 Rows are never shuffled; early stopping uses the later-in-time val split.
 """
+import json
 import sys
 import time
 from pathlib import Path
@@ -64,6 +65,23 @@ def predict_lgbm(model, rows, feat):
     return model.predict(_X(feat, _rows(rows)), num_iteration=model.best_iteration)
 
 
+INTERVAL_JSON = MODEL_DIR / "interval.json"
+
+
+def resid_std(model, val, feat, target=0):
+    """std(actual - pred) on the val split (NaN targets masked): basis of the 95% interval."""
+    ids, y = val
+    yt = y[:, target]
+    ok = ~np.isnan(yt)
+    return float(np.std(yt[ok] - predict_lgbm(model, _rows(ids)[ok], feat)))
+
+
+def save_resid_std(name, value):
+    d = json.loads(INTERVAL_JSON.read_text()) if INTERVAL_JSON.exists() else {}
+    d[name] = value
+    INTERVAL_JSON.write_text(json.dumps(d))
+
+
 def score(pred, y):
     ok = ~np.isnan(y)
     p, t = pred[ok], y[ok]
@@ -84,6 +102,9 @@ if __name__ == "__main__":
         secs = time.time() - t1
         path = MODEL_DIR / f"lgbm_{name}.txt"
         model.save_model(str(path), num_iteration=model.best_iteration)
+        info["resid_std_y" if target == 0 else "resid_std_y5"] = rs = resid_std(model, sp["val"], feat, target)
+        save_resid_std(name, rs)
+        print(f"  val resid_std={rs:.5f}")
         print(f"\n[{name}] train {secs:.0f}s rounds={info['n_rounds']} val={info['val_metric']} "
               f"file={path.name} {path.stat().st_size / 1e6:.1f}MB")
         print("  top gain:", list(info["feature_importance"].items())[:6])

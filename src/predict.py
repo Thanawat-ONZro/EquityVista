@@ -10,6 +10,7 @@ approximation (see README limitations).
 EDUCATIONAL ONLY, NOT FINANCIAL ADVICE. Measured edge on 2018-2020 data is ~1-3 pp direction accuracy
 and it does not survive trading costs (see data/processed/eval_summary.txt).
 """
+import json
 import os
 import sys
 from datetime import timedelta
@@ -112,7 +113,16 @@ def predict_ticker(ticker: str, n_days: int = 60) -> dict:
     while nxt.weekday() >= 5:                      # skip weekends; exchange holidays are not modelled
         nxt += timedelta(days=1)
     conf = float(min(1.0, abs(lgbm_ret) / (last["vol20"] + 1e-9)))   # |pred| / own 20d vol, heuristic
+    # Model-driven (val-residual) interval, NOT a calibrated VaR. None if interval.json is missing.
+    try:
+        rs = json.loads((MODEL_DIR / "interval.json").read_text())["y"]
+        half = 1.96 * rs
+        iv_log = [lgbm_ret - half, lgbm_ret + half]
+        iv = [float(px * np.exp(v)) for v in iv_log]
+    except (OSError, KeyError, ValueError):
+        iv_log = iv = None
     return {
+        "interval_95": iv, "interval_95_log": iv_log,
         "ticker": ticker, "date": last["date"], "last_close": float(px), "next_date": nxt,
         "next_day_return_pred": lgbm_ret, "direction": "UP" if lgbm_ret >= 0 else "DOWN",
         "confidence": conf, "price_prev": float(px), "price_pred": float(px * np.exp(lgbm_ret)),
