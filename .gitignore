@@ -1,15 +1,13 @@
 .venv/
-data/RAW/*.csv
+data/RAW/
+data/processed/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.nbconvert.ipynb
+
+# trained model binaries (large, regenerable)
 models/*.keras
 models/*.pkl
-
-# generated data artifacts (large)
-data/processed/*.parquet
-data/processed/*.npy
-data/processed/*.h5
 models/*.txt
 models/*.npz
