@@ -31,7 +31,7 @@ import polars as pl
 from scipy import stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.split_us import FEATS, ROOT  # noqa: E402
+from src.split import FEATS, ROOT  # noqa: E402
 
 OUT = ROOT / "data" / "processed"
 METRICS = ("corr", "ic", "auc", "diracc")
@@ -211,8 +211,8 @@ def _selfcheck():
 
 def main():
     _selfcheck()
-    from src.models_us import cnn_lstm_model as cnn
-    from src.models_us.lgbm_model import MODEL_DIR, predict_lgbm
+    from src.models import cnn_lstm_model as cnn
+    from src.models.lgbm_model import MODEL_DIR, predict_lgbm
     import lightgbm as lgb
 
     t0 = time.time()
@@ -220,7 +220,7 @@ def main():
     feat = pl.read_parquet(FEATS)
     print(f"loaded in {time.time() - t0:.0f}s")
     m_cnn = cnn.keras.models.load_model(cnn.MODEL_PATH)
-    boosters = [lgb.Booster(model_file=str(MODEL_DIR / f"lgbm_us_{n}.txt")) for n in ("y", "y5")]
+    boosters = [lgb.Booster(model_file=str(MODEL_DIR / f"lgbm_{n}.txt")) for n in ("y", "y5")]
 
     splits, dates, rows_of = {}, {}, {}
     for k in ("test_seen", "test_unseen"):
@@ -251,15 +251,15 @@ def main():
             del preds["CNN-LSTM"]            # CNN-LSTM has no 5-day head
         res.append(compare(preds, splits, dates, target, COST, step))
     res = pd.concat(res, ignore_index=True)
-    res.to_csv(OUT / "eval_us_results.csv", index=False)
+    res.to_csv(OUT / "eval_results.csv", index=False)
     txt = ("EquityVista US evaluation -- per-day metrics, mean over days with 95% t-CI.\n"
            f"Net spread = gross long-short decile spread - {2 * COST} bps round trip per rebalance.\n"
            "diracc compared with the train-majority baseline on the same days (rule 4).\n"
            "h=5 table: LGBM y5 head; '1d-reversal' row there = -ret5; CNN-LSTM has no 5d head.\n"
            + render(res))
-    (OUT / "eval_us_summary.txt").write_text(txt, encoding="utf-8")
+    (OUT / "eval_summary.txt").write_text(txt, encoding="utf-8")
     print(txt)
-    print(f"\nsaved {OUT / 'eval_us_results.csv'}\nsaved {OUT / 'eval_us_summary.txt'}  ({time.time() - t0:.0f}s)")
+    print(f"\nsaved {OUT / 'eval_results.csv'}\nsaved {OUT / 'eval_summary.txt'}  ({time.time() - t0:.0f}s)")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ import numpy as np
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.split_us import FEATS, ROOT, make_splits  # noqa: E402
+from src.split import FEATS, ROOT, make_splits  # noqa: E402
 
 RANKED = ["ret1", "ret5", "ret20", "ret60", "vol20", "vol60",
           "close_ma20", "close_ma50", "rsi14", "macd_n", "vol_z", "hl_range"]
@@ -82,7 +82,7 @@ if __name__ == "__main__":
         t1 = time.time()
         model, info = train_lgbm(sp["train"], sp["val"], feat, target=target)
         secs = time.time() - t1
-        path = MODEL_DIR / f"lgbm_us_{name}.txt"
+        path = MODEL_DIR / f"lgbm_{name}.txt"
         model.save_model(str(path), num_iteration=model.best_iteration)
         print(f"\n[{name}] train {secs:.0f}s rounds={info['n_rounds']} val={info['val_metric']} "
               f"file={path.name} {path.stat().st_size / 1e6:.1f}MB")

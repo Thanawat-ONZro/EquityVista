@@ -1,14 +1,14 @@
 """Production next-day prediction for ANY US ticker (no per-ticker training or state).
 
-Models are fixed (models/lgbm_us_y.txt, models/cnn_lstm_us.keras). The features are scale-free,
+Models are fixed (models/lgbm_y.txt, models/cnn_lstm.keras). The features are scale-free,
 but 13 of the 25 LGBM features are SAME-DATE cross-sectional (mkt_ret and the r_* percentile ranks),
 so a lone ticker has no cross-section. We therefore download the requested ticker together with a
-fixed basket of liquid large caps (REFERENCE) and run features_us.add_features on the whole panel.
+fixed basket of liquid large caps (REFERENCE) and run features.add_features on the whole panel.
 The ranks are relative to that ~40-name basket, not the 2,447-name training universe: an
 approximation (see README limitations).
 
 EDUCATIONAL ONLY, NOT FINANCIAL ADVICE. Measured edge on 2018-2020 data is ~1-3 pp direction accuracy
-and it does not survive trading costs (see data/processed/eval_us_summary.txt).
+and it does not survive trading costs (see data/processed/eval_summary.txt).
 """
 import os
 import sys
@@ -23,22 +23,22 @@ import polars as pl
 import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.features_us import add_features  # noqa: E402
-from src.models_us import cnn_lstm_model as cnn  # noqa: E402
-from src.models_us.lgbm_model import FEATURES as LGBM_FEATURES  # noqa: E402
-from src.models_us.lgbm_model import MODEL_DIR, predict_lgbm  # noqa: E402
-from src.split_us import FEATS, HOLDOUT_TXT, make_splits  # noqa: E402
+from src.features import add_features  # noqa: E402
+from src.models import cnn_lstm_model as cnn  # noqa: E402
+from src.models.lgbm_model import FEATURES as LGBM_FEATURES  # noqa: E402
+from src.models.lgbm_model import MODEL_DIR, predict_lgbm  # noqa: E402
+from src.split import FEATS, HOLDOUT_TXT, make_splits  # noqa: E402
 
 REFERENCE = ("AAPL MSFT AMZN GOOGL META NVDA TSLA JPM JNJ V WMT PG XOM UNH HD MA BAC KO PEP CVX "
              "ABBV MRK PFE COST CSCO TMO ADBE CRM NKE MCD INTC T VZ ORCL ABT DIS WFC CAT IBM HON").split()
-SCALER = MODEL_DIR / "cnn_lstm_us_scaler.npz"
+SCALER = MODEL_DIR / "cnn_lstm_scaler.npz"
 DISCLAIMER = "Educational, not financial advice."
 _models = {}
 
 
 def _booster():
     if "lgbm" not in _models:
-        m = lgb.Booster(model_file=str(MODEL_DIR / "lgbm_us_y.txt"))
+        m = lgb.Booster(model_file=str(MODEL_DIR / "lgbm_y.txt"))
         m.best_iteration = m.current_iteration()    # saved with num_iteration=best -> use all trees
         _models["lgbm"] = m
     return _models["lgbm"]

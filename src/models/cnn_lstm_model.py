@@ -17,14 +17,14 @@ import polars as pl
 import keras
 from keras import layers
 
-from src.split_us import FEATS, make_splits
+from src.split import FEATS, make_splits
 
 W = 60
 FEATURES = ["ret1", "ret5", "ret20", "vol20", "close_ma20", "close_ma50",
             "rsi14", "macd_n", "vol_z", "hl_range", "mkt_ret"]
 RET_SCALE = 100.0
 OFFS = np.arange(-W + 1, 1)
-MODEL_PATH = Path(__file__).resolve().parent.parent.parent / "models" / "cnn_lstm_us.keras"
+MODEL_PATH = Path(__file__).resolve().parent.parent.parent / "models" / "cnn_lstm.keras"
 
 
 class Windows(keras.utils.PyDataset):

@@ -98,7 +98,7 @@ A single fixed model scored across thousands of US stocks (the Phase-1 PTT.BK pi
 
 **Models:** LightGBM (primary; 25 scale-free features, `y` and `y5` heads) and a CNN-LSTM comparison arm (60-day windows, CPU-trained on a 300-ticker subsample). Global-calendar split (train ≤ 2015, val 2016-17, test 2018-20, 60-day gaps) with 20% of tickers held out as *unseen*.
 
-**Results** (test 2018-2020, 565 days, mean over days with 95% t-CI; net = after 20 bps round-trip; full tables in `data/processed/eval_us_summary.txt`):
+**Results** (test 2018-2020, 565 days, mean over days with 95% t-CI; net = after 20 bps round-trip; full tables in `data/processed/eval_summary.txt`):
 
 | 1-day, split | Model | Mean daily IC | Direction acc. − majority (pp) | Net decile spread (bps) |
 | --- | --- | --- | --- | --- |
@@ -116,19 +116,19 @@ A single fixed model scored across thousands of US stocks (the Phase-1 PTT.BK pi
 **Limitations**
 - **Survivorship bias:** the universe is what the dump lists; delisted names are under-represented.
 - **Data ends 2020-04-01**: the models are stale for today's market and were never refit on recent data.
-- **Live ranks are approximate:** `mkt_ret` and the `r_*` ranks need a cross-section, so `predict_us.py` uses a ~40-stock large-cap reference basket instead of the 2,447-name training universe.
+- **Live ranks are approximate:** `mkt_ret` and the `r_*` ranks need a cross-section, so `predict.py` uses a ~40-stock large-cap reference basket instead of the 2,447-name training universe.
 - **CPU-only:** the CNN-LSTM saw a 300-ticker subsample for 3 epochs; a bigger run might change its result.
 - **No edge after costs**; CIs are slightly optimistic (daily IC is mildly autocorrelated); the 20 bps cost is a flat assumption. **Educational, not financial advice.**
 
 **Run it**
 ```bash
-python -m src.predict_us                 # AAPL, MSFT (+ a few held-out symbols, best effort)
-python -m src.predict_us NVDA KO         # any tickers; exits non-zero if a requested ticker fails
-jupyter notebook notebooks/us_pipeline.ipynb   # reproduces the pipeline from saved artifacts
+python -m src.predict                 # AAPL, MSFT (+ a few held-out symbols, best effort)
+python -m src.predict NVDA KO         # any tickers; exits non-zero if a requested ticker fails
+jupyter notebook notebooks/pipeline.ipynb   # reproduces the pipeline from saved artifacts
 ```
-Needs internet (`yfinance`). The first CNN-LSTM prediction caches the TRAIN-only scaler to `models/cnn_lstm_us_scaler.npz`.
+Needs internet (`yfinance`). The first CNN-LSTM prediction caches the TRAIN-only scaler to `models/cnn_lstm_scaler.npz`.
 
-**Phase 2 (desktop app):** the planned PySide6 app should call `predict_us.predict_ticker()` and show it as a scanner, with the limitations above visible.
+**Phase 2 (desktop app):** the planned PySide6 app should call `predict.predict_ticker()` and show it as a scanner, with the limitations above visible.
 
 ## Future work — Phase 2 (planned, not implemented)
 
