@@ -6,3 +6,8 @@ __pycache__/
 *.nbconvert.ipynb
 models/*.keras
 models/*.pkl
+
+# generated data artifacts (large)
+data/processed/*.parquet
+data/processed/*.npy
+data/processed/*.h5
