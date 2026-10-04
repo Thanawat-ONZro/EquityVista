@@ -11,3 +11,5 @@ models/*.pkl
 data/processed/*.parquet
 data/processed/*.npy
 data/processed/*.h5
+models/*.txt
+models/*.npz
