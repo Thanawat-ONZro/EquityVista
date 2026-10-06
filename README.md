@@ -1,135 +1,98 @@
-# EquityVista — Next-Day Stock Forecasting with an ARIMA + LSTM + RandomForest Ensemble
+# EquityVista — will a US stock be higher next month? (direction classification)
 
-**Problem:** predict the next trading day's **direction** (up / down / flat), **closing price** and a **95% interval** for a Thai stock (PTT.BK) using an AI/ML ensemble, and evaluate it honestly.
+Educational ML project (course 240-318 Artificial Intelligence and Machine Learning): for every US stock, predict whether its price
+will be **higher one month from now** (21 trading days ≈ 30 calendar days) from 25 scale-free price/volume features, with three
+classifiers compared on the same base, and judge them honestly against the "always UP" baseline. *Not financial advice.*
 
-## Approach
+## What it does
 
-Three complementary models, merged by a small aggregator:
-
-| Model | Type | Role | Output |
-| --- | --- | --- | --- |
-| ARIMA(5,1,0) | Statistical | Linear trend / autocorrelation | Next-day price + 95% CI |
-| LSTM(50)→Dropout(0.2)→LSTM(50)→Dropout(0.2)→Dense(1) | Deep learning | Non-linear momentum (60-day windows) | Next-day price |
-| RandomForest (200 trees) | Machine learning | 3-class direction (up / down / flat) | Class probabilities |
-| **Ensemble** | Aggregator | Combines the above | Direction + confidence + price + 95% interval |
-
-**Ensemble rules:** direction and confidence come from the RandomForest class probabilities; price = `0.6 × ARIMA + 0.4 × LSTM`; the interval is ARIMA's 1-day 95% CI.
-
-**Data:** PTT.BK from Yahoo Finance (`yfinance`), 2016-01-01 → 2024-12-31, 2186 trading days. **80/20 chronological split, no shuffling.**
-
-### Data-leak discipline
-- **Scalers fit on the training set only** (separate feature and target `MinMaxScaler`s), predictions inverse-transformed before metrics.
-- **RF label is the *next-day* direction.** Using same-day direction leaks the answer (accuracy 1.000); the correct shifted label gives 0.366.
-- **ARIMA is scored with rolling one-step-ahead forecasts.** A single 428-step forecast produced absurdly wide intervals; ARIMA uses a `log1p` transform (inverted with `expm1`), and the next-day interval comes from a full-history refit.
-- LSTM trains up to 80 epochs with `EarlyStopping` (stopped around epoch 32).
+1. **Data:** Kaggle US stock CSVs (1962-2020, CC0) + yfinance (2020-2026). Columns: `Date, Open, High, Low, Close, Adj Close, Volume`.
+   One uniform cleaning standard (9 rules) over the whole window: 29,503,886 raw rows → **27,627,816 rows, 5,122 tickers**
+   (`data/processed/dataset_1962_2026.parquet`). Outliers are capped (per-date 1 %/99 %), not deleted.
+2. **Features:** 25 per ticker-day (13 per-row + 12 same-date percentile ranks), no prices/ticker/date as input (`src/features.py`).
+3. **Target:** up = `ln(close[t+21] / close[t]) > 0` (`src/features.add_targets`).
+4. **Split (fixed calendar):** train ..2021, validation 2022-2023, test 2024 → end of data; **60-trading-day embargo**;
+   20 % of tickers held out as "unseen" (`src/split.py`). Every choice is made on validation; the test split chooses nothing.
+5. **Models, all classifiers that output P(up)** (same target, features, split, training size and metrics): Logistic Regression,
+   Random Forest, LightGBM. Training size (~1M rows), feature set and hyper-parameters were chosen by validation experiments
+   (`../REPORT/figures/experiments.json`).
+6. **Metrics** (`src/metrics.py`): confusion matrix, accuracy vs "always UP", precision, recall, F1, balanced accuracy, AUC,
+   rank-IC per day with a 95 % interval, calibration (ECE); each also on the unseen tickers.
+7. **Desktop app** (PySide6, `app/`): one Predict page: UP/DOWN with the model's chance, the active run's test metrics next to the other
+   model types, and a backtest with reveal. The active run = the one with the best **validation** rank-IC (`models/active.json`).
 
 ## Results
 
-Test window, PTT.BK. **Units:** MAE and RMSE in THB; MAPE in %; accuracy = 3-class direction accuracy (RF/Ensemble only). `NaN` = not applicable to that model.
+`python train_all.py demo --seeds 5` (5 seeds per model, 36 min in total). Test = 2024-01-02 → 2026-09-03, 1,686,875 rows; mean ± sd over the seeds:
 
-| Model | MAE (THB) | RMSE (THB) | MAPE (%) | Direction acc. |
-| --- | --- | --- | --- | --- |
-| ARIMA | 0.2125 | 0.3038 | 0.7436 | NaN |
-| LSTM | 0.3078 | 0.4158 | 1.0755 | NaN |
-| RF | NaN | NaN | NaN | 0.3388 |
-| Ensemble | 0.2379 | 0.3244 | 0.8321 | 0.3388 |
-| *Naive (previous close, reference)* | 0.2067 | 0.3035 | 0.7236 | — |
+| Model | accuracy % | precision % | recall % | F1 % | AUC | rank-IC validation | rank-IC test | rank-IC unseen tickers | ECE |
+|---|---|---|---|---|---|---|---|---|---|
+| Baseline: always UP | 53.0% | 53.0% | 100.0 | 69.3% | 0.500 | – | – | – | – |
+| LightGBM (used by the app) | 54.7 ± 0.1 | 54.7 ± 0.3 | 84.0 ± 3.4 | 66.2 ± 0.8 | 0.551 ± 0.002 | 0.083 ± 0.001 | 0.064 ± 0.001 | 0.069 ± 0.001 | 0.014 ± 0.001 |
+| Random Forest | 54.9 ± 0.0 | 54.9 ± 0.1 | 83.2 ± 0.5 | 66.2 ± 0.1 | 0.553 ± 0.000 | 0.083 ± 0.000 | 0.065 ± 0.000 | 0.070 ± 0.001 | 0.014 ± 0.001 |
+| Logistic Regression | 54.7 ± 0.0 | 54.7 ± 0.0 | 84.1 ± 0.4 | 66.3 ± 0.1 | 0.554 ± 0.000 | 0.078 ± 0.000 | 0.062 ± 0.000 | 0.067 ± 0.000 | 0.011 ± 0.000 |
 
-> **Next-day forecast for PTT.BK (after 2024-12-31):** direction **DOWN**, confidence **48%**, price **28.38 THB**, 95% interval **[27.52, 29.33]**.
+Seed-42 run, 95 % interval from the daily values of the test split:
 
-### Honest interpretation
-- Price error of the ensemble is **about the same as the naive "tomorrow = today" baseline**, i.e. the stock behaves close to a random walk at a 1-day horizon.
-- Direction accuracy (0.3388) is **below the majority-class baseline**, so the direction signal is not useful here.
-- This is a school project. The result is reported as measured, not tuned to look good. **It is not financial advice.**
+| Model | test rank-IC | accuracy above always-UP, points per day | train time |
+|---|---|---|---|
+| LightGBM | +0.065 [+0.054, +0.075] | +1.57 [+1.10, +2.04] | 83 s |
+| Random Forest | +0.065 [+0.055, +0.076] | +1.73 [+1.29, +2.17] | 319 s |
+| Logistic Regression | +0.062 [+0.050, +0.073] | +1.56 [+1.15, +1.97] | 24 s |
+
+Every model beats "always UP" by 1.7-1.8 points of pooled accuracy with an interval above zero, every P(up) passes the
+calibration check, and the three models are within noise of each other: the ceiling comes from the features, not from the model.
+Full report: `../REPORT/EquityVista_Report.pdf`.
+
+**Limitations:** survivorship bias (1,751 of the 5,112 tickers have no post-2020 data, so validation/test hold only survivors);
+one test regime (2024-2026), one split (no walk-forward); price/volume features only; live predictions take `mkt_ret` from a
+40-stock large-cap basket (`src/predict.py::REFERENCE`).
 
 ## Repository structure
 
 ```
-EquityVista/
-├── config.py            # ticker, dates, seed, LSTM window, train/test split
-├── requirements.txt     # dependencies (requirements.lock.txt = pinned versions)
-├── src/
-│   ├── fetch.py         # download PTT.BK from Yahoo Finance -> data/RAW
-│   ├── features.py      # technical indicators, labels, chronological split
-│   ├── evaluate.py      # MAE / RMSE / MAPE, accuracy, confusion matrix
-│   ├── ensemble.py      # direction + confidence + price + 95% interval
-│   └── models/          # arima.py, lstm.py, rf_classifier.py
-├── notebooks/
-│   ├── EDA.ipynb        # data exploration
-│   └── results.ipynb    # trains models, comparison table, next-day forecast
-├── tests/               # pytest suite
-├── data/                # RAW/ and processed/ (generated)
-└── app/                 # PLANNED (Phase 2) - not implemented yet
+config.py                 the ONE place for data paths: RAW_KAGGLE, RAW_YF, DATASET, FEATURES
+src/
+  extend_fetch.py         yfinance -> data/RAW/yfinance/*.csv
+  clean.py                ONE cleaning standard (+ outlier flags, winsorize, universe flag)
+  build_dataset.py        RAW union -> data/processed/dataset_1962_2026.parquet (+ reports/clean_report.txt)
+  eda.py                  validation report (reports/eda_report.txt)
+  features.py             25 features + target + no-look-ahead test
+  split.py                calendar split, embargo, unseen tickers
+  metrics.py              confusion matrix, accuracy/precision/recall/F1, AUC, rank-IC with intervals, calibration, threshold
+  active.py               models/active.json (active run per horizon)
+  predict.py              forecast for any ticker (CLI and app)
+  models/                 common.py (features list, loader), lgbm_model.py
+  jobs/                   one CLI module per job: data_extend, build_features, train_{logistic,rf,lgbm}, evaluate
+app/                      PySide6 Predict app (see app/README.md)
+train_all.py              one command: features -> 3 models x N seeds -> compare -> activate the best on validation
+tests/                    pytest suite (54 tests)
 ```
+Generated, git-ignored: `data/RAW/`, `data/processed/`, `runs/`, `reports/`, `models/*`.
 
-## How to run
+## How to reproduce
 
-Requires Python ≥ 3.11 (git-bash syntax; on cmd use `.venv\Scripts\activate`).
+Needs Python ≥ 3.11 and internet (Kaggle files are not in the repo; yfinance for 2020+).
 
 ```bash
 python -m venv .venv
-source .venv/Scripts/activate
+.venv\Scripts\activate
 pip install -r requirements.txt
-
-python src/fetch.py                      # download data
-
-jupyter notebook notebooks/EDA.ipynb     # explore
-jupyter notebook notebooks/results.ipynb # reproduce results
-
-# or run headless:
-jupyter nbconvert --to notebook --execute --inplace notebooks/EDA.ipynb notebooks/results.ipynb
+pip install polars pyarrow joblib PySide6 lightweight-charts psutil
 ```
 
-## Testing
+1. **Raw data** (once): put the Kaggle CSVs in `data/RAW/kaggle/` and `symbols_valid_meta.csv` in `data/RAW/`.
+2. **Fetch 2020-2026 + clean:** `python -m src.jobs.data_extend`
+3. **Features:** `python -m src.jobs.build_features --params '{"leakage_test": 1}'`
+4. **Train, compare, activate:** `python train_all.py demo --seeds 5` (one seed: about 7 min). Defaults of every job: `src/jobs/__init__.py`.
+5. **App:** `python app/main.py`   CLI: `python -m src.predict NVDA KO`
+6. **Tests:** `python -m pytest tests -q` → 54 passed.
 
-```bash
-pytest tests/
-```
+## Documents (outside git, in `../REPORT/`)
 
-7 tests (features, evaluation metrics, ensemble) — all pass.
-
-## Task 12: Large multi-ticker US forecaster
-
-A single fixed model scored across thousands of US stocks (the Phase-1 PTT.BK pipeline above is unchanged).
-
-**Framing:** a *cross-sectional ranker / daily scanner*, **not a price oracle**. It predicts each ticker's next-day log return from scale-free features and is judged per trading day (rank-IC, AUC, long-short decile spread), never on pooled rows.
-
-**Data:** Kaggle US stock-market CSVs, **CC0** licence. 24.2M raw rows → **11.06M rows, 2,447 tickers** after ETL (penny/illiquid/ETF filtering; `data/processed/etl_report.txt`). Dates 1962 → **2020-04-01**.
-
-**Models:** LightGBM (primary; 25 scale-free features, `y` and `y5` heads) and a CNN-LSTM comparison arm (60-day windows, CPU-trained on a 300-ticker subsample). Global-calendar split (train ≤ 2015, val 2016-17, test 2018-20, 60-day gaps) with 20% of tickers held out as *unseen*.
-
-**Results** (test 2018-2020, 565 days, mean over days with 95% t-CI; net = after 20 bps round-trip; full tables in `data/processed/eval_summary.txt`):
-
-| 1-day, split | Model | Mean daily IC | Direction acc. − majority (pp) | Net decile spread (bps) |
-| --- | --- | --- | --- | --- |
-| seen | LGBM | +0.0131 [+0.0048, +0.0213] | +2.78 [+0.41, +5.15] | −14.82 [−24.82, −4.81] |
-| seen | CNN-LSTM | −0.0028 [−0.0150, +0.0094] | +1.26 [−1.20, +3.72] | −19.90 [−33.63, −6.17] |
-| seen | 1d-reversal | +0.0010 [−0.0088, +0.0108] | +1.20 [−0.88, +3.29] | −30.03 [−44.16, −15.90] |
-| unseen | LGBM | +0.0122 [+0.0033, +0.0210] | +2.90 [+0.48, +5.31] | −12.70 [−23.59, −1.82] |
-| unseen | CNN-LSTM | −0.0074 [−0.0199, +0.0051] | +1.26 [−1.27, +3.79] | −23.92 [−39.60, −8.23] |
-| unseen | 1d-reversal | +0.0026 [−0.0076, +0.0127] | +1.19 [−0.92, +3.31] | −24.89 [−39.63, −10.14] |
-
-5-day horizon (LGBM `y5` head): IC +0.0264 [+0.0040, +0.0489] on seen tickers (positive), +0.0191 [−0.0060, +0.0443] on unseen (not distinguishable from 0); net spread negative in both.
-
-**Verdict:** no model beats the baselines after costs. LightGBM has a small, statistically positive IC and a few points of direction accuracy over the majority baseline, but every net decile spread is negative (**not tradable**). The CNN-LSTM shows no edge and does not beat the LightGBM baseline.
-
-**Limitations**
-- **Survivorship bias:** the universe is what the dump lists; delisted names are under-represented.
-- **Data ends 2020-04-01**: the models are stale for today's market and were never refit on recent data.
-- **Live ranks are approximate:** `mkt_ret` and the `r_*` ranks need a cross-section, so `predict.py` uses a ~40-stock large-cap reference basket instead of the 2,447-name training universe.
-- **CPU-only:** the CNN-LSTM saw a 300-ticker subsample for 3 epochs; a bigger run might change its result.
-- **No edge after costs**; CIs are slightly optimistic (daily IC is mildly autocorrelated); the 20 bps cost is a flat assumption. **Educational, not financial advice.**
-
-**Run it**
-```bash
-python -m src.predict                 # AAPL, MSFT (+ a few held-out symbols, best effort)
-python -m src.predict NVDA KO         # any tickers; exits non-zero if a requested ticker fails
-jupyter notebook notebooks/pipeline.ipynb   # reproduces the pipeline from saved artifacts
-```
-Needs internet (`yfinance`). The first CNN-LSTM prediction caches the TRAIN-only scaler to `models/cnn_lstm_scaler.npz`.
-
-**Phase 2 (desktop app):** the planned PySide6 app should call `predict.predict_ticker()` and show it as a scanner, with the limitations above visible.
-
-## Future work — Phase 2 (planned, not implemented)
-
-A desktop app (**PySide6**) in `app/` that loads the trained ensemble and shows live next-day forecasts. Further modelling ideas: more features (market index, news sentiment), walk-forward validation, and multiple tickers.
+| File | Content |
+|---|---|
+| `EquityVista_Report.docx/.pdf` | the course report (Thai) |
+| `Mini_Project_Proposal.docx/.pdf` | the topic proposal |
+| `RESULTS.md` | results of the current runs (section B) and the history before them |
+| `_build/` | scripts that rebuild the figures, numbers and both documents |

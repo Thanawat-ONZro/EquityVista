@@ -1,18 +1,19 @@
 # EquityVista desktop app
 
-Single-view dark dashboard: ticker bar, candlestick chart (lightweight-charts) with the predicted
-next-day price as a dashed "Forecast" line, and a results panel. Uses `src/predict.py`.
+One page: **Predict** (candlestick chart + H-day forecast panel, backtest with reveal). It uses the active run
+(`models/active.json`: the run with the best validation rank-IC) through `src/predict.py` and shows that run's test metrics next to the other model types.
 
-## Install
+The app trains nothing. Training runs from the command line, from the repo root:
 ```
-pip install -r requirements.txt   # includes PySide6 and lightweight-charts
+python train_all.py demo --seeds 5  # ~36 min (one seed: ~7 min): trains the 3 classifiers, compares, activates the best on validation
+python train_all.py demo --fetch  # first refresh the 2020+ prices from yfinance and rebuild the dataset + features
 ```
-
-## Run
-From the repo root (needs `models/lgbm_y.txt` and `models/cnn_lstm.keras`; without them the chart still works):
+Then start (or restart) the app:
 ```
 python app/main.py
 ```
-Type a US ticker, press Predict. The first prediction is slow (TensorFlow load + 2y download).
+Predict -> ticker + days (21 trading days = 1 month, about 30 calendar days; a horizon needs its own trained model) -> **Predict**.
 
-*Educational, not financial advice; measured: no edge after costs.*
+The former Training Hub pages (Dashboard / Jobs / Models / Settings) are archived in `../REPORT/archive/app_training_hub/`.
+
+*Educational, not financial advice; measured: under 2 points of direction accuracy above always-UP.*

@@ -1,10 +1,15 @@
 .venv/
 data/RAW/
 data/processed/
+runs/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.nbconvert.ipynb
+
+# non-source artefacts: reports, notes, teaching material (kept out of git on purpose)
+scratch/
+reports/
 
 # trained model binaries (large, regenerable)
 models/*.keras

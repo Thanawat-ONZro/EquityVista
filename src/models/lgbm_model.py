@@ -1,113 +1,80 @@
-"""LightGBM primary model (plan rule 4: boosted trees first) for the US panel.
+"""LightGBM (boosted decision trees = an extension of the course's tree ensembles).
 
-Features (25, all scale-free -> rule 2): 13 per-row features + their 12 same-date
-cross-sectional percentile ranks. No ticker/date, no adj_* price/volume levels
-(adj_close is a level; close_ma20/50 are ratios and fine). mkt_ret is the
-same-date cross-sectional mean return (known at close t, no lookahead).
-
-Two heads, same features: target 0 = y (t+1 log ret), target 1 = y5 (t+1..t+5,
-NaN tail rows masked). The 5-day head is cheap and feeds the decile spread.
-Rows are never shuffled; early stopping uses the later-in-time val split.
+A binary classifier: label = 1 if the H-day forward return is > 0, output = P(up). Rows are never shuffled; the number
+of trees and the hyper-parameter search both use the later-in-time validation split (never the test split).
+Trees: every fit runs to its round cap, then `pick_rounds` keeps the checkpoint with the best validation IC. (Early
+stopping on the validation loss was dropped: on these noisy labels the loss bottoms out after a handful of trees, long
+before the ranking stops improving, so it produced near-constant models.)
+Search: a small random search over lr / num_leaves / min_data / feature_fraction, scored by validation IC (mean daily
+cross-sectional corr of P(up) with the real return), bounded by `trials` and `max_minutes`.
 """
-import json
-import sys
 import time
-from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
-import polars as pl
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.split import FEATS, ROOT, make_splits  # noqa: E402
+from src import metrics
+from src.models.common import FEATURES, X
 
-RANKED = ["ret1", "ret5", "ret20", "ret60", "vol20", "vol60",
-          "close_ma20", "close_ma50", "rsi14", "macd_n", "vol_z", "hl_range"]
-FEATURES = RANKED + ["mkt_ret"] + [f"r_{c}" for c in RANKED]
-MODEL_DIR = ROOT / "models"
-
-
-def _rows(ids):
-    return ids["row"].to_numpy() if isinstance(ids, pl.DataFrame) else np.asarray(ids)
+BASE = dict(objective="binary", bagging_fraction=0.7, bagging_freq=1,
+            lambda_l2=10.0, verbose=-1, feature_pre_filter=False)  # pre_filter off: min_data can change per trial
+SEARCH_ROUNDS = 300  # rounds per search trial
+GRID = (25, 50, 100, 200, 400, 800, 1600, 3200, 6400)  # tree counts compared by validation IC
 
 
-def _X(feat, rows):
-    return feat[rows, FEATURES].cast(pl.Float32).to_numpy()
+def prep(train, val, feat):
+    """(ids, y) splits -> (train Dataset, val Dataset), label = y > 0. Binned once, reused by every trial."""
+    (it, yt), (iv, yv) = train, val
+    dt = lgb.Dataset(X(feat, it), (yt > 0).astype(np.float32), feature_name=FEATURES, free_raw_data=False,
+                     params={"feature_pre_filter": False})
+    dv = lgb.Dataset(X(feat, iv), (yv > 0).astype(np.float32), reference=dt, free_raw_data=False)
+    return dt, dv
 
 
-def train_lgbm(train, val, feat, objective="regression", seed=42, target=0,
-               rounds=500, patience=30):
-    """train/val = (ids, y) from make_splits. target 0 -> y, 1 -> y5. Returns (Booster, info)."""
-    data = []
-    for ids, y in (train, val):
-        yt = y[:, target]
-        ok = ~np.isnan(yt)
-        data.append((_X(feat, _rows(ids)[ok]), yt[ok]))
-    (Xt, yt), (Xv, yv) = data
-    params = dict(objective=objective, learning_rate=0.05, num_leaves=63, min_data_in_leaf=2000,
-                  feature_fraction=0.8, bagging_fraction=0.7, bagging_freq=1, lambda_l2=10.0,
-                  seed=seed, verbose=-1)
-    if objective == "huber":
-        params["alpha"] = 0.05  # log-return scale
-    dt = lgb.Dataset(Xt, yt, feature_name=FEATURES, free_raw_data=True)
-    dv = lgb.Dataset(Xv, yv, reference=dt)
-    model = lgb.train(params, dt, rounds, valid_sets=[dv],
-                      callbacks=[lgb.early_stopping(patience, verbose=False)])
-    metric = next(iter(model.best_score["valid_0"].items()))
-    imp = dict(sorted(zip(FEATURES, model.feature_importance("gain").round(1)),
-                      key=lambda kv: -kv[1]))
-    return model, {"feature_importance": imp, "n_rounds": model.best_iteration,
-                   "val_metric": {metric[0]: metric[1]}}
+def _params(lr, num_leaves, min_data, feature_fraction, seed, n_train):
+    return {**BASE, "learning_rate": lr, "num_leaves": int(num_leaves), "feature_fraction": feature_fraction,
+            "min_data_in_leaf": int(min(min_data, max(20, n_train // 50))), "seed": seed}  # clamp: tiny quick runs
 
 
-def predict_lgbm(model, rows, feat):
-    """rows: DataFrame with `row` col or int array -> predicted return per row."""
-    return model.predict(_X(feat, _rows(rows)), num_iteration=model.best_iteration)
+def fit(dt, dv, params, rounds, callbacks=()):
+    return lgb.train(params, dt, rounds, valid_sets=[dt, dv], valid_names=["train", "val"], callbacks=list(callbacks))
 
 
-INTERVAL_JSON = MODEL_DIR / "interval.json"
+def pick_rounds(model, Xv, yv, dates) -> float:
+    """Sets model.best_iteration to the GRID checkpoint (or the last round) with the best validation IC; returns that IC.
+    yv = the forward RETURN (not the 0/1 label). ponytail: a coarse grid, not every round; a finer grid costs one predict per extra point."""
+    n = model.current_iteration()
+    ics = {k: metrics.daily_ic(model.predict(Xv, num_iteration=k), yv, dates) for k in [*(k for k in GRID if k < n), n]}
+    model.best_iteration = max(ics, key=lambda k: ics[k] if np.isfinite(ics[k]) else -1.0)
+    return ics[model.best_iteration]
 
 
-def resid_std(model, val, feat, target=0):
-    """std(actual - pred) on the val split (NaN targets masked): basis of the 95% interval."""
-    ids, y = val
-    yt = y[:, target]
-    ok = ~np.isnan(yt)
-    return float(np.std(yt[ok] - predict_lgbm(model, _rows(ids)[ok], feat)))
+def trim(model):
+    """A booster holding only the trees `pick_rounds` kept, so a plain model.predict(X) is the final model."""
+    return lgb.Booster(model_str=model.model_to_string(num_iteration=model.best_iteration))
 
 
-def save_resid_std(name, value):
-    d = json.loads(INTERVAL_JSON.read_text()) if INTERVAL_JSON.exists() else {}
-    d[name] = value
-    INTERVAL_JSON.write_text(json.dumps(d))
+def search(dt, dv, val, feat, base, trials, max_minutes, seed, n_train, on_trial=None):
+    """Best {lr, num_leaves, min_data, feature_fraction} by validation IC. `base` = the job's own params
+    (always tried first, so the search can only improve on them). Returns (best dict, results list)."""
+    iv, yv = val
+    dates = iv["date"]
+    Xv = X(feat, iv)
+    t0, results = time.time(), []
 
+    def score(c):
+        m = fit(dt, dv, _params(c["lr"], c["num_leaves"], c["min_data"], c["feature_fraction"], seed, n_train), SEARCH_ROUNDS)
+        ic = pick_rounds(m, Xv, yv, dates)
+        results.append({**c, "val_ic": ic, "rounds": m.best_iteration})
+        if on_trial:
+            on_trial(len(results), trials, ic)
 
-def score(pred, y):
-    ok = ~np.isnan(y)
-    p, t = pred[ok], y[ok]
-    nz = t != 0
-    return {"corr": float(np.corrcoef(p, t)[0, 1]), "mean_abs_y": float(np.abs(t).mean()),
-            "diracc": float((np.sign(p[nz]) == np.sign(t[nz])).mean())}
-
-
-if __name__ == "__main__":
-    t0 = time.time()
-    feat = pl.read_parquet(FEATS)
-    sp = make_splits(feat)
-    print(f"load+split {time.time() - t0:.0f}s; {len(FEATURES)} features")
-    MODEL_DIR.mkdir(exist_ok=True)
-    for target, name in ((0, "y"), (1, "y5")):
-        t1 = time.time()
-        model, info = train_lgbm(sp["train"], sp["val"], feat, target=target)
-        secs = time.time() - t1
-        path = MODEL_DIR / f"lgbm_{name}.txt"
-        model.save_model(str(path), num_iteration=model.best_iteration)
-        info["resid_std_y" if target == 0 else "resid_std_y5"] = rs = resid_std(model, sp["val"], feat, target)
-        save_resid_std(name, rs)
-        print(f"  val resid_std={rs:.5f}")
-        print(f"\n[{name}] train {secs:.0f}s rounds={info['n_rounds']} val={info['val_metric']} "
-              f"file={path.name} {path.stat().st_size / 1e6:.1f}MB")
-        print("  top gain:", list(info["feature_importance"].items())[:6])
-        for split in ("val", "test_seen", "test_unseen"):
-            ids, y = sp[split]
-            print(f"  {split:12s}", score(predict_lgbm(model, ids, feat), y[:, target]))
+    rng = np.random.default_rng(seed)
+    score(base)  # the baseline counts as trial 1
+    while len(results) < trials and time.time() - t0 < max_minutes * 60:
+        score({"lr": float(np.exp(rng.uniform(np.log(0.02), np.log(0.15)))),
+               "num_leaves": int(np.exp(rng.uniform(np.log(15), np.log(255)))),
+               "min_data": int(np.exp(rng.uniform(np.log(200), np.log(5000)))),
+               "feature_fraction": float(rng.uniform(0.5, 1.0))})
+    best = max(results, key=lambda r: r["val_ic"] if np.isfinite(r["val_ic"]) else -1)
+    return {k: best[k] for k in ("lr", "num_leaves", "min_data", "feature_fraction")}, results

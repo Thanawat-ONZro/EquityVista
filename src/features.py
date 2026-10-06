@@ -1,7 +1,9 @@
 """Scale-free, leakage-safe feature builder for the US multi-ticker model.
 
 Features at day t use only data <= t (per-ticker rolling/ewm are causal; the
-cross-sectional ranks and mkt_ret only look at the same date t).
+cross-sectional ranks, winsorization bounds, universe flag and mkt_ret only look at the same date t).
+Outliers are CAPPED, never deleted (src/clean.py: per-date 1 %/99 % percentiles); `in_universe` is the optional
+training filter (default off, see clean.universe_flag).
 """
 import time
 from pathlib import Path
@@ -9,20 +11,25 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from config import DATASET, FEATURES
+from src import clean as K
+
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "data" / "processed" / "us_market.parquet"
-OUT = ROOT / "data" / "processed" / "features.parquet"
+SRC = DATASET
+OUT = FEATURES
 
 WARMUP = 60  # first 60 rows per ticker dropped (ret60 needs 61 prices)
 RANKED = ["ret1", "ret5", "ret20", "ret60", "vol20", "vol60",
           "close_ma20", "close_ma50", "rsi14", "macd_n", "vol_z", "hl_range"]
+CAPPED = [f for f in RANKED if f != "rsi14"]  # rsi14 is bounded 0..100 already
 
 
 def _g(e):
     return e.over("ticker")
 
 
-def add_features(df: pl.DataFrame) -> pl.DataFrame:
+def add_features(df: pl.DataFrame, cap: bool = True) -> pl.DataFrame:
+    """cap=False skips the final per-date winsorization (predict.py caps against the training reference instead)."""
     df = df.select("ticker", "date", "adj_open", "adj_high", "adj_low",
                    "adj_close", "adj_volume").sort("ticker", "date")
     c = pl.col("adj_close")
@@ -40,8 +47,10 @@ def add_features(df: pl.DataFrame) -> pl.DataFrame:
         _up=_g(delta.clip(lower_bound=0).ewm_mean(alpha=1 / 14, adjust=False)),   # Wilder smoothing
         _dn=_g((-delta).clip(lower_bound=0).ewm_mean(alpha=1 / 14, adjust=False)),
     ).with_columns(rsi14=100 - 100 / (1 + pl.col("_up") / (pl.col("_dn") + 1e-12)))
-    # market return uses every ticker/row (incl. warmup) of that date only
-    df = df.with_columns(mkt_ret=pl.col("ret1").mean().over("date"))
+    # market return uses every ticker/row (incl. warmup) of that date only; capped first (the mean is outlier-sensitive)
+    r = pl.col("ret1")
+    df = df.with_columns(mkt_ret=r.clip(r.quantile(K.WINSOR[0], "linear").over("date"), r.quantile(K.WINSOR[1], "linear").over("date")).mean().over("date"))
+    df = K.add_universe(df)
     # drop per-ticker warmup, then non-finite rows (zero prices etc.)
     df = df.filter(pl.int_range(pl.len()).over("ticker") >= WARMUP)
     feats = RANKED + ["mkt_ret"]
@@ -51,15 +60,17 @@ def add_features(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
         (pl.col(f).rank("average").over("date") / pl.len().over("date")).alias(f"r_{f}")
         for f in RANKED)
-    return df.drop("_up", "_dn")
+    df = df.drop("_up", "_dn")
+    return K.winsorize(df, CAPPED) if cap else df  # ranks above use the uncapped values (order is all they need)
 
 
-def add_targets(df: pl.DataFrame) -> pl.DataFrame:
-    """y = next-day log return; y5 = next-5-day cumulative log return (t+1..t+5).
-    Rows with null y (last row per ticker) are dropped; y5 may be null at the tail."""
+def add_targets(df: pl.DataFrame, horizon: int = 21) -> pl.DataFrame:
+    """y = forward log return over `horizon` trading days: log(close[t+H] / close[t]).
+    Rows without a full horizon ahead (last H rows per ticker) are dropped.
+    ponytail: shift counts ROWS, not calendar days; rows dropped for non-finite features make it approximate."""
     df = df.sort("ticker", "date")
-    df = df.with_columns(y=_g(pl.col("ret1").shift(-1)), y5=_g(pl.col("ret5").shift(-5)))
-    return df.drop_nulls("y")
+    c = pl.col("adj_close")
+    return df.with_columns(y=_g((c.shift(-horizon) / c).log())).drop_nulls("y")
 
 
 def test_no_lookahead(df: pl.DataFrame, n=10, n_tickers=50, seed=0, tol=1e-9):
@@ -75,9 +86,12 @@ def test_no_lookahead(df: pl.DataFrame, n=10, n_tickers=50, seed=0, tol=1e-9):
         part = add_features(df.filter(pl.col("date") <= cut))
         ref = full.filter(pl.col("date") <= cut)
         assert part.shape == ref.shape, (cut, part.shape, ref.shape)
-        a = ref.sort("ticker", "date").select(cols).to_numpy()
-        b = part.sort("ticker", "date").select(cols).to_numpy()
-        assert np.abs(a - b).max() <= tol, f"lookahead at cut {cut}: {np.abs(a - b).max()}"
+        a = ref.sort("ticker", "date").select(cols).to_numpy().astype(float)
+        b = part.sort("ticker", "date").select(cols).to_numpy().astype(float)
+        # adj_open may be missing (kept rows with no open, see clean.py): a missing value must be missing in both
+        assert (np.isnan(a) == np.isnan(b)).all(), f"lookahead at cut {cut}: missing values differ"
+        worst = np.nanmax(np.abs(a - b), initial=0.0)
+        assert worst <= tol, f"lookahead at cut {cut}: {worst}"
     return True
 
 

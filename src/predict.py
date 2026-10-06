@@ -1,66 +1,59 @@
-"""Production next-day prediction for ANY US ticker (no per-ticker training or state).
+"""Production H-day forecast for ANY US ticker (no per-ticker training or state).
 
-Models are fixed (models/lgbm_y.txt, models/cnn_lstm.keras). The features are scale-free,
-but 13 of the 25 LGBM features are SAME-DATE cross-sectional (mkt_ret and the r_* percentile ranks),
-so a lone ticker has no cross-section. We therefore download the requested ticker together with a
-fixed basket of liquid large caps (REFERENCE) and run features.add_features on the whole panel.
-The ranks are relative to that ~40-name basket, not the 2,447-name training universe: an
-approximation (see README limitations).
+Model = the active run for that horizon (models/active.json, see src/active.py); every model type is a classifier.
+Output: P(up) = the chance that the price is higher after H trading days (H = 21 = one month), and direction = UP if P(up) >= 0.5.
+The model says nothing about the SIZE of the move, so there is no expected return, target price or price range.
 
-EDUCATIONAL ONLY, NOT FINANCIAL ADVICE. Measured edge on 2018-2020 data is ~1-3 pp direction accuracy
-and it does not survive trading costs (see data/processed/eval_summary.txt).
+13 of the 25 features are SAME-DATE cross-sectional (mkt_ret and the r_* percentile ranks), so a lone ticker
+has no cross-section. The ranks (and the outlier caps) come from the run's model/ref_quantiles.json: quantiles of
+each feature over the last year of the training features file, i.e. the same universe the model was trained on.
+mkt_ret is still the mean of a fixed basket of liquid large caps (REFERENCE): an approximation.
+
+EDUCATIONAL ONLY, NOT FINANCIAL ADVICE. Measured edge is small.
 """
 import json
-import os
 import sys
-from datetime import timedelta
 from pathlib import Path
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-import lightgbm as lgb
+import joblib
 import numpy as np
 import pandas as pd
 import polars as pl
 import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.features import add_features  # noqa: E402
-from src.models import cnn_lstm_model as cnn  # noqa: E402
-from src.models.lgbm_model import FEATURES as LGBM_FEATURES  # noqa: E402
-from src.models.lgbm_model import MODEL_DIR, predict_lgbm  # noqa: E402
-from src.split import FEATS, HOLDOUT_TXT, make_splits  # noqa: E402
+from src import active  # noqa: E402
+from src.features import CAPPED, add_features  # noqa: E402
+from src.models.common import FEATURES  # noqa: E402
 
 REFERENCE = ("AAPL MSFT AMZN GOOGL META NVDA TSLA JPM JNJ V WMT PG XOM UNH HD MA BAC KO PEP CVX "
              "ABBV MRK PFE COST CSCO TMO ADBE CRM NKE MCD INTC T VZ ORCL ABT DIS WFC CAT IBM HON").split()
-SCALER = MODEL_DIR / "cnn_lstm_scaler.npz"
 DISCLAIMER = "Educational, not financial advice."
-_models = {}
+_models = {}  # path -> (fitted pipeline, run metrics, reference quantiles); keyed by file so an active-model switch reloads itself
 
 
-def _booster():
-    if "lgbm" not in _models:
-        m = lgb.Booster(model_file=str(MODEL_DIR / "lgbm_y.txt"))
-        m.best_iteration = m.current_iteration()    # saved with num_iteration=best -> use all trees
-        _models["lgbm"] = m
-    return _models["lgbm"]
+class NoModelError(ValueError):
+    """No active model for the requested horizon."""
+
+    def __init__(self, horizon):
+        super().__init__(f"no active model for the {horizon}-day horizon")
+        self.horizon = horizon
 
 
-def _cnn():
-    if "cnn" not in _models:
-        import keras
-        _models["cnn"] = keras.saving.load_model(cnn.MODEL_PATH, compile=False)
-    return _models["cnn"]
-
-
-def _cnn_scaler():
-    """Global TRAIN-only mean/std the CNN was trained with; computed once from features.parquet, cached."""
-    if not SCALER.exists():
-        feat = pl.read_parquet(FEATS, columns=["ticker", "date"] + cnn.FEATURES + ["y", "y5"])
-        tr = make_splits(feat)["train"][0]["row"].to_numpy()
-        X = feat.select(cnn.FEATURES).to_numpy().astype("float32")[tr]
-        np.savez(SCALER, mu=X.mean(0), sd=X.std(0) + 1e-9)
-    z = np.load(SCALER)
-    return z["mu"], z["sd"]
+def _load(horizon):
+    p = active.path(horizon)
+    if p is None:
+        raise NoModelError(horizon)
+    if p not in _models:
+        run = p.parent.parent
+        try:
+            m = json.loads((run / "metrics.json").read_text())
+            ref = json.loads((run / "model" / "ref_quantiles.json").read_text())
+        except (OSError, KeyError, ValueError) as e:
+            raise ValueError(f"run {run.name} is incomplete, retrain it (python train_all.py): {e}") from e
+        _models.clear()
+        _models[p] = (joblib.load(p), m, ref)
+    return _models[p]
 
 
 def _fetch(ticker):
@@ -85,73 +78,60 @@ def _fetch(ticker):
     return pl.concat(frames)
 
 
-def predict_ticker(ticker: str, n_days: int = 60) -> dict:
-    """Next-trading-day log-return predictions for `ticker` from both fixed models.
-
-    n_days = CNN-LSTM window length (the saved model needs 60). Raises ValueError if data is missing/too short.
-    """
-    ticker = ticker.upper().strip()
-    if n_days != cnn.W:
-        raise ValueError(f"n_days must be {cnn.W} (the saved CNN-LSTM window)")
-    feat = add_features(_fetch(ticker))
+def predict_ticker(ticker: str, horizon: int = 21, hide: int = 0) -> dict:
+    """H-trading-day forecast for `ticker`. Raises NoModelError if no active model for `horizon`,
+    ValueError if data is missing/too short. hide=N (backtest): the last N trading days of the ticker are dropped
+    from EVERY symbol BEFORE the features are built, so the forecast starts at that earlier cutoff date and nothing
+    after it (not even the same-date cross-sectional ranks) is used."""
+    ticker, horizon, hide = ticker.upper().strip(), int(horizon), int(hide)
+    model, m, ref = _load(horizon)  # fail fast, before the download
+    raw = _fetch(ticker)
+    if hide:
+        days = raw.filter(pl.col("ticker") == ticker)["date"].unique().sort()
+        if len(days) <= hide + 100:
+            raise ValueError(f"{ticker}: not enough history to hide {hide} days")
+        raw = raw.filter(pl.col("date") <= days[-hide - 1])
+    feat = add_features(raw, cap=False)
     mine = feat.filter(pl.col("ticker") == ticker).sort("date")
-    if mine.height < n_days:
-        raise ValueError(f"{ticker}: only {mine.height} usable feature rows, need {n_days}")
+    if mine.is_empty():
+        raise ValueError(f"{ticker}: not enough history for the features")
     last = mine.row(-1, named=True)
-
-    # LGBM: scale-free features of the last row (same column order as training: imported FEATURES)
-    assert set(LGBM_FEATURES) <= set(mine.columns)
-    lgbm_ret = float(predict_lgbm(_booster(), np.array([mine.height - 1]), mine)[0])
-
-    # CNN-LSTM: last 60 rows, standardised with the TRAIN stats
-    mu, sd = _cnn_scaler()
-    win = np.clip((mine.tail(n_days).select(cnn.FEATURES).to_numpy().astype("float32") - mu) / sd, -8, 8)
-    cnn_ret = float(_cnn().predict(win[None], verbose=0)[1].ravel()[0] / cnn.RET_SCALE)
-
-    px = mine.tail(1)["adj_close"][0]
-    nxt = last["date"] + timedelta(days=1)
-    while nxt.weekday() >= 5:                      # skip weekends; exchange holidays are not modelled
-        nxt += timedelta(days=1)
-    conf = float(min(1.0, abs(lgbm_ret) / (last["vol20"] + 1e-9)))   # |pred| / own 20d vol, heuristic
-    # Model-driven (val-residual) interval, NOT a calibrated VaR. None if interval.json is missing.
-    try:
-        rs = json.loads((MODEL_DIR / "interval.json").read_text())["y"]
-        half = 1.96 * rs
-        iv_log = [lgbm_ret - half, lgbm_ret + half]
-        iv = [float(px * np.exp(v)) for v in iv_log]
-    except (OSError, KeyError, ValueError):
-        iv_log = iv = None
+    for f, q in ref.items():  # rank + cap against the training universe, not the download basket
+        last[f"r_{f}"] = float(np.interp(last[f], q, np.linspace(0, 1, len(q))))
+        if f in CAPPED:
+            last[f] = float(np.clip(last[f], q[1], q[-2]))  # the training features are capped at the 1 % / 99 % percentiles
+    x = np.array([[last[f] for f in FEATURES]], np.float32)
+    p_up = float(model.predict_proba(x)[0, 1] if hasattr(model, "predict_proba") else model.predict(x)[0])  # else: LightGBM Booster
+    px = float(last["adj_close"])
+    target = pd.bdate_range(last["date"], periods=horizon + 1)[-1].date()  # weekends skipped; holidays are not modelled
     return {
-        "interval_95": iv, "interval_95_log": iv_log,
-        "ticker": ticker, "date": last["date"], "last_close": float(px), "next_date": nxt,
-        "next_day_return_pred": lgbm_ret, "direction": "UP" if lgbm_ret >= 0 else "DOWN",
-        "confidence": conf, "price_prev": float(px), "price_pred": float(px * np.exp(lgbm_ret)),
-        "model": "LightGBM",
-        "cnn_lstm": {"next_day_return_pred": cnn_ret, "direction": "UP" if cnn_ret >= 0 else "DOWN",
-                     "price_pred": float(px * np.exp(cnn_ret))},
+        "ticker": ticker, "horizon": horizon, "date": last["date"], "target_date": target, "last_close": px,
+        "direction": "UP" if p_up >= 0.5 else "DOWN",
+        "confidence": p_up,                                       # P(up)
+        "calibrated": bool(m.get("test_calibrated", 1)),          # False: P(up) failed the calibration check on test
+        "hidden": hide, "run_id": active.run_id(horizon),
         "stale_days": (pd.Timestamp.today().normalize() - pd.Timestamp(last["date"])).days,
     }
 
 
 def show(r: dict) -> None:
-    c = r["cnn_lstm"]
-    print(f"\n=== {r['ticker']} | last close {r['last_close']:.2f} on {r['date']} -> next session {r['next_date']} ===\n"
-          f"  LightGBM : {r['next_day_return_pred']:+.3%}  {r['direction']:4s} "
-          f"(price view {r['price_pred']:.2f}, |pred|/vol20 = {r['confidence']:.2f})\n"
-          f"  CNN-LSTM : {c['next_day_return_pred']:+.3%}  {c['direction']:4s} (price view {c['price_pred']:.2f})\n"
-          f"  Measured: LGBM ~51.5% direction acc., no edge after costs; CNN-LSTM no edge. {DISCLAIMER}")
+    print(f"\n=== {r['ticker']} | last close {r['last_close']:.2f} on {r['date']} -> {r['horizon']} trading days "
+          f"(~{r['target_date']}) ===\n"
+          f"  {r['direction']:4s} P(up) = {r['confidence']:.0%}{'' if r['calibrated'] else ' (not calibrated)'}\n  {DISCLAIMER}")
     if r["stale_days"] > 5:
         print(f"  WARNING: last bar is {r['stale_days']} days old")
 
 
 if __name__ == "__main__":
-    tickers = sys.argv[1:] or ["AAPL", "MSFT"]
-    extra = HOLDOUT_TXT.read_text().split()[:3] if not sys.argv[1:] and HOLDOUT_TXT.exists() else []
+    args = sys.argv[1:]
+    horizon = int(args.pop(args.index("--days") + 1)) if "--days" in args else 21
+    if "--days" in args:
+        args.remove("--days")
     failed = 0
-    for t in tickers + extra:      # held-out symbols are best-effort (many are delisted since 2020)
+    for t in args or ["AAPL", "MSFT"]:
         try:
-            show(predict_ticker(t))
-        except Exception as e:     # keep going; non-zero exit only if a requested ticker failed
-            failed += t in tickers
+            show(predict_ticker(t, horizon))
+        except Exception as e:     # keep going; non-zero exit if any requested ticker failed
+            failed += 1
             print(f"\n=== {t} === ERROR: {e}", file=sys.stderr)
     sys.exit(1 if failed else 0)
