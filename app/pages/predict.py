@@ -21,7 +21,7 @@ from src import active  # noqa: E402
 from src import predict as P  # noqa: E402
 from src.split import TRAIN_END  # noqa: E402
 
-DISCLAIMER = "Educational, not financial advice; measured: little or no edge after costs"
+DISCLAIMER = "Educational, not financial advice"
 MIN_BARS, VIEW_BARS, RIGHT_PAD = 5, 120, 12  # fewer than MIN_BARS = unusable; view = last VIEW_BARS candles + forecast + RIGHT_PAD empty slots
 DEFAULT_DAYS = 21
 NO_MODEL = "No active model for this horizon (python train_all.py)"
@@ -86,27 +86,6 @@ def clamp_width(w) -> int:
         return PANEL_W
 
 
-VERDICT_COLOR = {"beats": GREEN, "useful": GREEN, "equal": AMBER, "weak": AMBER, "not proven": AMBER,
-                 "worse": RED, "none": RED, "n/a": DIM}
-
-
-class Meter(QWidget):
-    """3-segment skill meter: none / weak / useful (segments up to `level` are lit)."""
-    def __init__(self):
-        super().__init__()
-        self.level, self.lit = 0, False
-        self.setFixedSize(54, 8)
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        col = QColor(VERDICT_COLOR[explain.IC_LEVELS[self.level]])
-        for i in range(3):
-            p.setBrush(col if self.lit and i <= self.level else QColor(EDGE))
-            p.drawRoundedRect(i * 19, 0, 16, 8, 3, 3)
-
-
 class CompareChart(QWidget):
     """Horizontal bars per model type: test IC, then direction accuracy with the 'always UP' baseline line."""
     ROW, LBL = 17, 78
@@ -155,14 +134,14 @@ class CompareChart(QWidget):
         f.setPixelSize(11)
         p.setFont(f)
         ics = [r["ic"] for r in self.rows if r["ic"] is not None]
-        self._group(p, 0, "Ranking skill (rank-IC; 0 = no skill)", [(r, r["ic"]) for r in self.rows],
-                    min([0, *ics]) - 0.005, max([0.05, *ics]), 0, "baseline: no skill", lambda v: f"{v:+.3f}")
+        self._group(p, 0, "Ranking skill (rank-IC)", [(r, r["ic"]) for r in self.rows],
+                    min([0, *ics]) - 0.005, max([0.05, *ics]), 0, "no skill", lambda v: f"{v:+.3f}")
         accs = [r["acc"] for r in self.rows if r["acc"] is not None]
         bases = [r["base"] for r in self.rows if r["base"] is not None]
         base = sum(bases) / len(bases) if bases else 0.5
         self._group(p, len(self.rows) * self.ROW + 36, "Direction accuracy", [(r, r["acc"]) for r in self.rows],
                     min([0.45, *accs, base]) - 0.01, max([0.6, *accs, base]) + 0.01, base,
-                    f"baseline: always UP {base:.0%}" if bases else "baseline: coin flip 50%", lambda v: f"{v:.1%}")
+                    f"always UP {base:.0%}" if bases else "coin flip 50%", lambda v: f"{v:.1%}")
 
 
 class PredictPage(QWidget):
@@ -242,13 +221,12 @@ class PredictPage(QWidget):
         name = registry.horizon_name(h)
         self.head.setText(f"FORECAST · {name.upper()}")
         rid = active.run_id(h) if active.path(h) else None
-        ic = self.mgr.jobs.get(rid, {}).get("metrics", {}).get(registry.KEY) if rid else None
-        self.model_lbl.setText(f"Model: {rid}" + (f" · rank-IC {ic:.3f}" if ic is not None else "") if rid
+        self.model_lbl.setText(f"Model: {registry.MODEL_NAME.get(self.mgr.jobs.get(rid, {}).get('type'), rid)}" if rid
                                else f"No model for {h} days yet.")
         for k, q in self.tips.items():
             q.setToolTip(explain.tip(k, h))
         self._helps()
-        self._quality(h, rid)
+        self._compare(h, rid)
 
     def reload_model(self):
         """active.json changed: refresh the header and re-run the last ticker (deferred while a prediction runs)."""
@@ -383,7 +361,7 @@ class PredictPage(QWidget):
         g.addWidget(self._card("Today"), 2, 0)
         g.addWidget(self._card("Horizon"), 2, 1)
         v.addLayout(g)
-        self._quality_block(v)
+        self._compare_block(v)
         self.note = QLabel("", objectName="disc", wordWrap=True)
         self.note.setContentsMargins(12, 6, 12, 0)
         v.addWidget(self.note)
@@ -397,84 +375,23 @@ class PredictPage(QWidget):
         self._set({})
         return outer
 
-    # ---- "How good is this model?" + "Compared with other models" ----
-    def _section(self, v, title):
+    # ---- "Compared with other models" ----
+    def _compare_block(self, v):
         v.addSpacing(14)
-        h = QLabel(title.upper(), objectName="head")
+        h = QLabel("COMPARED WITH OTHER MODELS", objectName="head")
         h.setContentsMargins(10, 0, 0, 4)
         v.addWidget(h)
-
-    def _quality_block(self, v):
-        self._section(v, "How good is this model?")
-        self.q_info = QLabel(objectName="status", wordWrap=True)
-        self.q_info.setContentsMargins(10, 0, 10, 4)
-        v.addWidget(self.q_info)
-        self.q_rows = {}
-        for key, title in (("acc", "Direction accuracy"), ("ic", "Ranking skill (rank-IC)"),
-                           ("unseen", "Works on unseen stocks?")):
-            c = GlowFrame("#2a3142", radius=12, g=2)
-            r = QVBoxLayout(c)
-            r.setContentsMargins(18, 8, 18, 8)
-            r.setSpacing(2)
-            top = QHBoxLayout()
-            top.addWidget(QLabel(title.upper(), objectName="key"))
-            top.addStretch(1)
-            meter, chip = Meter(), QLabel()
-            meter.hide()
-            top.addWidget(meter)
-            top.addWidget(chip)
-            r.addLayout(top)
-            val = QLabel(objectName="val", wordWrap=True)
-            note = QLabel(objectName="disc", wordWrap=True)
-            note.setStyleSheet("color: #8a90a0;")
-            r.addWidget(val)
-            r.addWidget(note)
-            v.addSpacing(2)
-            v.addWidget(c)
-            self.q_rows[key] = (val, note, chip, meter)
-        self._section(v, "Compared with other models")
         self.cmp_chart = CompareChart()
         v.addWidget(self.cmp_chart)
         self.cmp_note = QLabel(objectName="disc", wordWrap=True)
         self.cmp_note.setContentsMargins(10, 0, 10, 0)
         v.addWidget(self.cmp_note)
 
-    @staticmethod
-    def _chip(chip, verdict):
-        col = VERDICT_COLOR[verdict]
-        chip.setText(verdict.upper())
-        chip.setStyleSheet(f"color: {col}; border: 1px solid {col}; border-radius: 8px; padding: 0 7px; "
-                           f"font-size: 10px; font-weight: 700;")
-
-    def _quality(self, h, rid):
-        q = explain.quality(rid, self.mgr.jobs) if rid else None
-        rows = self.q_rows
-        for val, _, chip, meter in rows.values():
-            chip.setText("")
-            chip.setStyleSheet("")
-            meter.hide()
-            val.setText("—")
-        for k, t in explain.QUALITY_HELP.items():
-            rows[k][1].setText(t)
-        if q is None:
-            self.q_info.setText("No trained model for this horizon, so there are no quality numbers yet.")
-        else:
-            yrs = f"{q['start_year']}-{TRAIN_END[:4]}" if q["start_year"] else "?"
-            self.q_info.setText(f"{q['model']} · run {q['run']} · trained on {yrs} · forecasts {registry.horizon_name(h)} ahead "
-                                f"({h} trading days)")
-            f = lambda x, fmt: "n/a" if x is None else format(x, fmt)  # noqa: E731
-            rows["acc"][0].setText(f"{f(q['acc'], '.1%')} right vs {f(q['base'], '.1%')} for always-guess-UP")
-            self._chip(rows["acc"][2], q["acc_verdict"])
-            rows["ic"][0].setText(f"rank-IC {f(q['ic'], '+.3f')}")
-            self._chip(rows["ic"][2], q["ic_verdict"])
-            rows["ic"][3].level, rows["ic"][3].lit = q["ic_level"], q["ic"] is not None
-            rows["ic"][3].show()
-            rows["unseen"][0].setText(f"rank-IC {f(q['unseen_ic'], '+.3f')}")
-            self._chip(rows["unseen"][2], q["unseen_verdict"])
+    def _compare(self, h, rid):
         cmp = explain.comparison(self.mgr.jobs, h, rid)
         self.cmp_chart.set_rows(cmp)
-        self.cmp_note.setText("Same horizon only; best run of each model type. Cyan = the model used here."
-                              if any(not r["active"] for r in cmp) else "Train the other models (python train_all.py) to compare")
+        self.cmp_note.setText("Test results. Cyan = the model in use." if any(not r["active"] for r in cmp)
+                              else "Train the other models (python train_all.py) to compare")
 
     def _helps(self):
         h = self.days.value() if hasattr(self, "days") else DEFAULT_DAYS
